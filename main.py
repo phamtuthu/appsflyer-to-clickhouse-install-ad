@@ -8,7 +8,7 @@ from clickhouse_driver import Client
 
 # --- Config từ biến môi trường hoặc ghi trực tiếp ---
 APPSFLYER_TOKEN = os.environ.get('APPSFLYER_TOKEN')
-APP_ID = os.environ.get('APP_ID')
+APP_IDS = os.environ.get('APP_IDS', 'id1203171490,vn.ghn.app.giaohangnhanh').split(',')
 CH_HOST = os.environ.get('CH_HOST')
 CH_PORT = int(os.environ.get('CH_PORT', 9000))
 CH_USER = os.environ.get('CH_USER')
@@ -83,13 +83,17 @@ DATETIME_CH_COLS = {
     "contributor_3_touch_time", "device_download_time"
 }
 
+def get_bundle_id(app_id):
+    if app_id == "id1203171490":
+        return "vn.ghn.app.shiip"
+    return app_id
+
 def parse_datetime(val):
     if val is None:
         return None
     s = str(val).strip()
     if s.lower() in ('', 'null', 'none', 'n/a'):
         return None
-    # Nếu có .000 thì bỏ đi
     if '.' in s:
         s = s.split('.')[0]
     match = re.match(r"^(\d{4}-\d{2}-\d{2}) (\d{1,2}):(\d{2}):(\d{2})$", s)
@@ -110,20 +114,19 @@ def get_vn_time_range(hours=2):
     from_time = to_time - timedelta(hours=hours)
     return from_time.strftime('%Y-%m-%d %H:%M:%S'), to_time.strftime('%Y-%m-%d %H:%M:%S')
 
-def download_appsflyer_installs(from_time, to_time):
+def download_appsflyer_installs(app_id, from_time, to_time):
     url = (
-        f"https://hq1.appsflyer.com/api/raw-data/export/app/{APP_ID}/installs_report/v5"
+        f"https://hq1.appsflyer.com/api/raw-data/export/app/{app_id}/installs_report/v5"
         f"?from={from_time}&to={to_time}&timezone=Asia%2FHo_Chi_Minh"
         f"&additional_fields={ADDITIONAL_FIELDS}"
     )
     headers = {"Authorization": APPSFLYER_TOKEN, "accept": "text/csv"}
     resp = requests.get(url, headers=headers)
     if resp.status_code != 200:
-        print("❌ Error:", resp.text)
+        print(f"❌ Error ({app_id}):", resp.text)
         return []
     csvfile = StringIO(resp.text)
     reader = csv.DictReader(csvfile)
-    # Remove BOM if exists
     reader.fieldnames = [h.strip('\ufeff') for h in reader.fieldnames]
     data = [row for row in reader]
     return data
@@ -131,52 +134,64 @@ def download_appsflyer_installs(from_time, to_time):
 def main():
     from_time, to_time = get_vn_time_range(2)
     print(f"🕒 Lấy AppsFlyer từ {from_time} đến {to_time} (Asia/Ho_Chi_Minh)")
-    raw_data = download_appsflyer_installs(from_time, to_time)
-    if not raw_data:
-        print("⚠️ Không có data AppsFlyer trong khoảng này.")
-        return
 
-    # Chuẩn hóa cột và lấy đúng thứ tự mapping
     appsflyer_cols = list(APPSFLYER_TO_CH.keys())
     ch_cols = list(APPSFLYER_TO_CH.values())
 
-    # Chuẩn hóa & map sang đúng format
-    mapped_data = []
-    for row in raw_data:
-        mapped_row = []
-        for af_col, ch_col in zip(appsflyer_cols, ch_cols):
-            val = row.get(af_col)
-            if ch_col in DATETIME_CH_COLS:
-                mapped_row.append(parse_datetime(val))
-            else:
-                mapped_row.append(val if val not in (None, "", "null", "None") else None)
-        mapped_data.append(mapped_row)
-
-    # Query ClickHouse để lấy các appsflyer_id đã có trong khoảng from_time → to_time
     client = Client(
         host=CH_HOST, port=CH_PORT, user=CH_USER, password=CH_PASSWORD, database=CH_DATABASE
     )
-    result = client.execute(
-        f"SELECT appsflyer_id FROM {CH_TABLE} WHERE install_time >= '{from_time}' AND install_time <= '{to_time}'"
-    )
-    existed = set(str(r[0]) for r in result if r[0])
-    print(f"🔎 Có {len(existed)} ID đã tồn tại trong ClickHouse.")
 
-    # Lọc dòng mới
-    afid_idx = ch_cols.index('appsflyer_id')
-    new_rows = [row for row in mapped_data if row[afid_idx] and row[afid_idx] not in existed]
-    print(f"➕ Số dòng mới sẽ insert: {len(new_rows)}")
+    total_inserted = 0
 
-    if new_rows:
-        client.execute(
-            f"INSERT INTO {CH_TABLE} ({', '.join(ch_cols)}) VALUES",
-            new_rows
+    for app_id in APP_IDS:
+        app_id = app_id.strip()
+        bundle_id = get_bundle_id(app_id)
+        print(f"\n==== Processing APP_ID: {app_id} (bundle_id={bundle_id}) ====")
+
+        raw_data = download_appsflyer_installs(app_id, from_time, to_time)
+        if not raw_data:
+            print(f"⚠️ Không có data AppsFlyer cho app {app_id} trong khoảng này.")
+            continue
+
+        # Chuẩn hóa & map sang đúng format
+        mapped_data = []
+        for row in raw_data:
+            mapped_row = []
+            for af_col, ch_col in zip(appsflyer_cols, ch_cols):
+                val = row.get(af_col)
+                if ch_col == "bundle_id":
+                    mapped_row.append(bundle_id)
+                elif ch_col in DATETIME_CH_COLS:
+                    mapped_row.append(parse_datetime(val))
+                else:
+                    mapped_row.append(val if val not in (None, "", "null", "None") else None)
+            mapped_data.append(mapped_row)
+
+        # Query ClickHouse để lấy các appsflyer_id đã có trong khoảng from_time → to_time với bundle_id tương ứng
+        result = client.execute(
+            f"SELECT appsflyer_id FROM {CH_TABLE} WHERE install_time >= '{from_time}' AND install_time <= '{to_time}' AND bundle_id = '{bundle_id}'"
         )
-        print("✅ Đã insert lên ClickHouse xong!")
-    else:
-        print("Không có dòng mới để insert.")
+        existed = set(str(r[0]) for r in result if r[0])
+        print(f"🔎 Có {len(existed)} ID đã tồn tại trong ClickHouse cho app {app_id}.")
+
+        # Lọc dòng mới
+        afid_idx = ch_cols.index('appsflyer_id')
+        new_rows = [row for row in mapped_data if row[afid_idx] and row[afid_idx] not in existed]
+        print(f"➕ Số dòng mới sẽ insert: {len(new_rows)}")
+
+        if new_rows:
+            client.execute(
+                f"INSERT INTO {CH_TABLE} ({', '.join(ch_cols)}) VALUES",
+                new_rows
+            )
+            print(f"✅ Đã insert lên ClickHouse xong cho app {app_id}! ({len(new_rows)} rows)")
+            total_inserted += len(new_rows)
+        else:
+            print("Không có dòng mới để insert.")
 
     client.disconnect()
+    print(f"\n== Tổng số rows insert vào ClickHouse (cả các app): {total_inserted} ==")
 
 if __name__ == "__main__":
     main()
